@@ -351,6 +351,37 @@ fn prevent_copying_into_self() {
 }
 
 #[test]
+fn preserves_timestamps() {
+    initialize();
+    let source = HYDRATED_DIR.join("preserves_timestamps");
+    remove(&source);
+    fs::create_dir(&source, DIR_MODE).unwrap();
+    let file = source.join("file.txt");
+    std::fs::write(&file, b"data").unwrap();
+    fs::symlink("file.txt", source.join("link")).unwrap();
+
+    // Set the file times before the directory's, as creating entries in a
+    // directory updates the directory's mtime.
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 123_456_789);
+    filetime::set_symlink_file_times(&file, old, old).unwrap();
+    filetime::set_symlink_file_times(source.join("link"), old, old).unwrap();
+    filetime::set_symlink_file_times(&source, old, old).unwrap();
+
+    let destination = COPIES_DIR.join("preserves_timestamps");
+    remove(&destination);
+    let result = fcp_run(&[&source, &destination]);
+    assert!(result.success);
+    assert_eq!(result.stderr, "");
+
+    for relative in ["", "file.txt", "link"] {
+        let path = destination.join(relative);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(&metadata);
+        assert_eq!(mtime, old, "mtime not preserved for {}", path.display());
+    }
+}
+
+#[test]
 fn prevent_duplicate_sources() {
     initialize();
     let source = HYDRATED_DIR.join("prevent_duplicate_sources");

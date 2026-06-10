@@ -33,10 +33,19 @@ fn copy_file(source: &Path, source_type: Result<FileType>, dest: &Path) -> bool 
         match source_type? {
             FileType::Regular => {
                 fs::copy(source, dest)?;
+                fs::copy_timestamps(&fs::symlink_metadata(source)?, dest)?;
             }
             FileType::Directory => return copy_directory(source, dest),
-            FileType::Symlink => fs::symlink(fs::read_link(source)?, dest)?,
-            FileType::Fifo => fs::mkfifo(dest, fs::symlink_metadata(source)?.permissions())?,
+            FileType::Symlink => {
+                let metadata = fs::symlink_metadata(source)?;
+                fs::symlink(fs::read_link(source)?, dest)?;
+                fs::copy_timestamps(&metadata, dest)?;
+            }
+            FileType::Fifo => {
+                let metadata = fs::symlink_metadata(source)?;
+                fs::mkfifo(dest, metadata.permissions())?;
+                fs::copy_timestamps(&metadata, dest)?;
+            }
             FileType::Socket => {
                 return Err(Error::new(format!(
                     "{}: sockets cannot be copied",
@@ -45,9 +54,12 @@ fn copy_file(source: &Path, source_type: Result<FileType>, dest: &Path) -> bool 
             }
             FileType::CharacterDevice | FileType::BlockDevice => {
                 let metadata = fs::symlink_metadata(source)?;
-                let mut source = fs::open(source)?;
-                let mut dest = fs::create(dest, metadata.permissions().mode())?;
-                io::copy(&mut source, &mut dest)?;
+                {
+                    let mut source = fs::open(source)?;
+                    let mut dest = fs::create(dest, metadata.permissions().mode())?;
+                    io::copy(&mut source, &mut dest)?;
+                }
+                fs::copy_timestamps(&metadata, dest)?;
             }
         }
         Ok(false)
@@ -60,7 +72,8 @@ fn copy_file(source: &Path, source_type: Result<FileType>, dest: &Path) -> bool 
 }
 
 fn copy_directory(source: &Path, dest: &Path) -> Result<bool> {
-    fs::create_dir(dest, fs::symlink_metadata(source)?.permissions().mode())?;
+    let metadata = fs::symlink_metadata(source)?;
+    fs::create_dir(dest, metadata.permissions().mode())?;
     let (mut entries, mut has_err) = (Vec::new(), false);
     for entry in fs::read_dir(source)? {
         match entry {
@@ -72,12 +85,16 @@ fn copy_directory(source: &Path, dest: &Path) -> Result<bool> {
         }
     }
     entries.shrink_to_fit();
-    Ok(entries
+    let has_err = entries
         .into_par_iter()
         .map(|(file_name, file_type)| {
             copy_file(&source.join(&file_name), file_type, &dest.join(&file_name))
         })
-        .reduce(|| has_err, BitOr::bitor))
+        .reduce(|| has_err, BitOr::bitor);
+    // Creating entries updates the directory's mtime, so the directory's own
+    // timestamps must be copied only after all of its children.
+    fs::copy_timestamps(&metadata, dest)?;
+    Ok(has_err)
 }
 
 fn reject_self_copies(sources: &[PathBuf], dest: &Path) -> Result<()> {

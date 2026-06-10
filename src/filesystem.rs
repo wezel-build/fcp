@@ -3,11 +3,14 @@
 //! usefulness of error messages by providing additional context.
 
 use crate::error::{Error, Result};
-use nix::sys::stat::Mode;
+use nix::sys::stat::{self, Mode};
+use nix::sys::time::TimeSpec;
 use nix::unistd;
 use std::convert::TryInto;
 use std::fs::{self, DirBuilder, DirEntry, File, Metadata, OpenOptions, Permissions, ReadDir};
-use std::os::unix::fs::{self as unix, DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{
+    self as unix, DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::path::{Path, PathBuf};
 
 macro_rules! wrap {
@@ -46,6 +49,21 @@ macro_rules! make_error_message {
     ($path:ident) => {
         |err| Error::new(format!("{}: {}", $path.display(), err))
     };
+}
+
+/// Copy `source`'s access and modification times onto `dest`. Operates on
+/// `dest` itself (not its target) when `dest` is a symlink.
+pub fn copy_timestamps(source: &Metadata, dest: &Path) -> Result<()> {
+    let atime = TimeSpec::new(source.atime(), source.atime_nsec());
+    let mtime = TimeSpec::new(source.mtime(), source.mtime_nsec());
+    stat::utimensat(
+        None,
+        dest,
+        &atime,
+        &mtime,
+        stat::UtimensatFlags::NoFollowSymlink,
+    )
+    .map_err(make_error_message!(dest))
 }
 
 pub fn entry_file_type(entry: &DirEntry) -> Result<FileType> {
