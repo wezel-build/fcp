@@ -55,16 +55,16 @@ fn fcp_benchmark(mut group: BenchmarkGroup<WallTime>, fixture_file: &str) {
 fn linux_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("Linux");
     group.sampling_mode(SamplingMode::Flat);
-    group.warm_up_time(Duration::from_secs(60));
-    group.sample_size(50);
+    group.warm_up_time(Duration::from_secs(3));
+    group.sample_size(10);
     fcp_benchmark(group, "linux.json");
 }
 
 fn large_files_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("Large Files");
     group.sampling_mode(SamplingMode::Flat);
-    group.warm_up_time(Duration::from_secs(60));
-    group.sample_size(100);
+    group.warm_up_time(Duration::from_secs(3));
+    group.sample_size(10);
     fcp_benchmark(group, "large_files.json");
 }
 
