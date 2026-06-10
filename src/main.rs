@@ -1,5 +1,6 @@
-use fcp::{fatal, fcp};
+use fcp::fcp;
 use std::env;
+use std::fmt::Display;
 use std::process;
 
 static HELP: &str = concat!(
@@ -23,6 +24,11 @@ OPTIONS:
 
 static VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn fatal(message: impl Display) -> ! {
+    eprintln!("{}", message);
+    process::exit(1);
+}
+
 fn main() {
     let args: Box<[String]> = env::args().skip(1).collect();
     for arg in args.iter() {
@@ -32,5 +38,7 @@ fn main() {
             _ => {}
         }
     }
-    process::exit(fcp(&args) as i32);
+    if let Err(err) = fcp(&args) {
+        fatal(err);
+    }
 }

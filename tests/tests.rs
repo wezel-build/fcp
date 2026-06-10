@@ -351,6 +351,17 @@ fn prevent_copying_into_self() {
 }
 
 #[test]
+fn library_returns_errors_instead_of_printing() {
+    initialize();
+    let destination = COPIES_DIR.join("library_returns_errors");
+    remove(&destination);
+    let source = "library_returns_errors_nonexistent";
+    let error = fcp::fcp(&[source.into(), destination.to_str().unwrap().into()])
+        .expect_err("copying a nonexistent source must fail");
+    assert!(error.to_string().contains(source));
+}
+
+#[test]
 fn preserves_timestamps() {
     initialize();
     let source = HYDRATED_DIR.join("preserves_timestamps");

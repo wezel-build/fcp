@@ -3,13 +3,10 @@ use std::array;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
-use std::fmt::Display;
 use std::fs::Metadata;
 use std::io;
-use std::ops::BitOr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process;
 
 pub mod error;
 pub mod filesystem;
@@ -17,25 +14,23 @@ pub mod filesystem;
 use crate::error::{Error, Result};
 use crate::filesystem::{self as fs, FileType};
 
-pub fn fatal(message: impl Display) -> ! {
-    eprintln!("{}", message);
-    process::exit(1);
+/// Concatenation for the parallel error-accumulating reductions below.
+fn concat<T>(mut left: Vec<T>, mut right: Vec<T>) -> Vec<T> {
+    left.append(&mut right);
+    left
 }
 
-// The boolean returned signifies whether an error occurred (`true`) or not (`false`). The purpose
-// of returning just a boolean instead of the underlying error itself is that we want to display
-// the error to the user as soon as it occurs (as this makes for a better user-experience during
-// long-running jobs) as opposed to propagating it upwards and printing all errors at the end.
-// However, at the end of the process we still need to know whether or not an error occurred at any
-// point in order to set the exit code appropriately.
-fn copy_file(source: &Path, source_type: Result<FileType>, dest: &Path) -> bool {
-    fn __copy_file(source: &Path, source_type: Result<FileType>, dest: &Path) -> Result<bool> {
+// Errors are accumulated and returned rather than written to stderr as they occur: the library
+// never prints, so embedders decide how (and whether) to report failures. A failed entry doesn't
+// abort the rest of the copy — everything that can be copied is, and all errors come back together.
+fn copy_file(source: &Path, source_type: Result<FileType>, dest: &Path) -> Vec<Error> {
+    fn __copy_file(source: &Path, source_type: Result<FileType>, dest: &Path) -> Result<Vec<Error>> {
         match source_type? {
             FileType::Regular => {
                 fs::copy(source, dest)?;
                 fs::copy_timestamps(&fs::symlink_metadata(source)?, dest)?;
             }
-            FileType::Directory => return copy_directory(source, dest),
+            FileType::Directory => return Ok(copy_directory(source, dest)),
             FileType::Symlink => {
                 let metadata = fs::symlink_metadata(source)?;
                 fs::symlink(fs::read_link(source)?, dest)?;
@@ -62,39 +57,46 @@ fn copy_file(source: &Path, source_type: Result<FileType>, dest: &Path) -> bool 
                 fs::copy_timestamps(&metadata, dest)?;
             }
         }
-        Ok(false)
+        Ok(Vec::new())
     }
 
-    __copy_file(source, source_type, dest).unwrap_or_else(|err| {
-        eprintln!("{}", err);
-        true
-    })
+    __copy_file(source, source_type, dest).unwrap_or_else(|err| vec![err])
 }
 
-fn copy_directory(source: &Path, dest: &Path) -> Result<bool> {
-    let metadata = fs::symlink_metadata(source)?;
-    fs::create_dir(dest, metadata.permissions().mode())?;
-    let (mut entries, mut has_err) = (Vec::new(), false);
-    for entry in fs::read_dir(source)? {
+fn copy_directory(source: &Path, dest: &Path) -> Vec<Error> {
+    let metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(err) => return vec![err],
+    };
+    if let Err(err) = fs::create_dir(dest, metadata.permissions().mode()) {
+        return vec![err];
+    }
+    let dir_entries = match fs::read_dir(source) {
+        Ok(dir_entries) => dir_entries,
+        Err(err) => return vec![err],
+    };
+    let (mut entries, mut errors) = (Vec::new(), Vec::new());
+    for entry in dir_entries {
         match entry {
             Ok(entry) => entries.push((entry.file_name(), fs::entry_file_type(&entry))),
-            Err(err) => {
-                eprintln!("{}", err);
-                has_err = true;
-            }
+            Err(err) => errors.push(Error::from(err)),
         }
     }
     entries.shrink_to_fit();
-    let has_err = entries
-        .into_par_iter()
-        .map(|(file_name, file_type)| {
-            copy_file(&source.join(&file_name), file_type, &dest.join(&file_name))
-        })
-        .reduce(|| has_err, BitOr::bitor);
+    errors.extend(
+        entries
+            .into_par_iter()
+            .map(|(file_name, file_type)| {
+                copy_file(&source.join(&file_name), file_type, &dest.join(&file_name))
+            })
+            .reduce(Vec::new, concat),
+    );
     // Creating entries updates the directory's mtime, so the directory's own
     // timestamps must be copied only after all of its children.
-    fs::copy_timestamps(&metadata, dest)?;
-    Ok(has_err)
+    if let Err(err) = fs::copy_timestamps(&metadata, dest) {
+        errors.push(err);
+    }
+    errors
 }
 
 fn reject_self_copies(sources: &[PathBuf], dest: &Path) -> Result<()> {
@@ -195,7 +197,7 @@ fn file_names(sources: &[PathBuf]) -> Result<Vec<&OsStr>> {
 }
 
 /// Copy each file in `sources` into the directory `dest`.
-fn copy_into(sources: &[PathBuf], dest: &Path) -> bool {
+fn copy_into(sources: &[PathBuf], dest: &Path) -> Vec<Error> {
     if let Some(err) = match fs::metadata(dest) {
         Err(err) => Some(err),
         Ok(metadata) if !metadata.is_dir() => {
@@ -203,39 +205,64 @@ fn copy_into(sources: &[PathBuf], dest: &Path) -> bool {
         }
         _ => reject_self_copies(sources, dest).err(),
     } {
-        fatal(err)
+        return vec![err];
     }
 
+    let file_names = match file_names(sources) {
+        Ok(file_names) => file_names,
+        Err(err) => return vec![err],
+    };
     sources
         .iter()
-        .zip(file_names(sources).unwrap_or_else(|err| fatal(err)))
+        .zip(file_names)
         .collect::<Box<_>>()
         .into_par_iter()
         .map(|(source, file_name)| copy_file(source, fs::file_type(source), &dest.join(file_name)))
-        .reduce(|| false, BitOr::bitor)
+        .reduce(Vec::new, concat)
 }
 
 // The `allow` here is present because clippy doesn't realize that `source` must be of
 // type `&PathBuf` in order for the call to `array::from_ref` to typecheck.
 #[allow(clippy::ptr_arg)]
-fn copy_single(source: &PathBuf, dest: &Path) -> bool {
-    let source_metadata = fs::symlink_metadata(source).unwrap_or_else(|err| fatal(err));
+fn copy_single(source: &PathBuf, dest: &Path) -> Vec<Error> {
+    let source_metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(err) => return vec![err],
+    };
     match (fs::metadata(dest), fs::symlink_metadata(dest)) {
         (Ok(metadata), _) if metadata.is_dir() => copy_into(array::from_ref(source), dest),
-        (_, Ok(metadata)) if source_metadata.ino() == metadata.ino() => fatal(format!(
+        (_, Ok(metadata)) if source_metadata.ino() == metadata.ino() => vec![Error::new(format!(
             "Cannot overwrite file '{}' with itself '{}'",
             source.display(),
             dest.display()
-        )),
+        ))],
         _ => copy_file(source, fs::file_type(source), dest),
     }
 }
 
-pub fn fcp(args: &[String]) -> bool {
+/// Copy each of the leading `args` to the final one, following `cp`'s CLI
+/// conventions. Copies as much as possible: a failed entry doesn't abort the
+/// remainder, and every failure is reported in the returned error, one per line.
+pub fn fcp(args: &[String]) -> Result<()> {
     let args: Box<_> = args.iter().map(PathBuf::from).collect();
-    match args.as_ref() {
-        [] | [_] => fatal("Please provide at least two arguments (run 'fcp --help' for details)"),
+    let errors = match args.as_ref() {
+        [] | [_] => {
+            return Err(Error::new(String::from(
+                "Please provide at least two arguments (run 'fcp --help' for details)",
+            )));
+        }
         [source, dest] => copy_single(source, dest),
         [sources @ .., dest] => copy_into(sources, dest),
+    };
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ))
     }
 }
